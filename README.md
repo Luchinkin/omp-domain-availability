@@ -39,9 +39,10 @@ The structured result includes:
 
 Works without credentials:
 
-- Registration status comes from RDAP.
+- Registration status comes directly from the registry endpoint listed in IANA's RDAP bootstrap.
 - Standard TLD prices and metadata come from Namecheap's public TLD catalog.
 - `unregistered` is intentionally not reported as `available`: registries may reserve names, and premium pricing may apply.
+- TLDs without an IANA-listed HTTPS RDAP service return `unknown`; an aggregator's `404` is never treated as proof that a domain is unregistered.
 - `priceKind: standard-tld` is an estimate for the extension, not a quote for that exact name.
 
 ### Namecheap API mode

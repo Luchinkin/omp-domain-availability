@@ -3,6 +3,7 @@ import type { CustomToolFactory } from "@oh-my-pi/pi-coding-agent";
 
 const NAMECHEAP_API_ENDPOINT = "https://api.namecheap.com/xml.response";
 const NAMECHEAP_PRICING_ENDPOINT = "https://www.namecheap.com/domains/tlds.ashx";
+const RDAP_BOOTSTRAP_ENDPOINT = "https://data.iana.org/rdap/dns.json";
 const MAX_DOMAINS = 50;
 
 type Availability = "available" | "registered" | "unregistered" | "unknown";
@@ -109,6 +110,31 @@ async function loadTldPricing(signal: AbortSignal): Promise<Map<string, TldPrici
   }
 }
 
+export function rdapServicesFromBootstrap(payload: unknown): Map<string, string> {
+  if (!payload || typeof payload !== "object" || !("services" in payload) || !Array.isArray(payload.services)) return new Map();
+  const services = new Map<string, string>();
+  for (const entry of payload.services) {
+    if (!Array.isArray(entry) || !Array.isArray(entry[0]) || !Array.isArray(entry[1])) continue;
+    const endpoint = entry[1].find((value): value is string => typeof value === "string" && value.startsWith("https://"));
+    if (!endpoint) continue;
+    for (const tld of entry[0]) {
+      if (typeof tld === "string") services.set(tld.toLowerCase(), endpoint);
+    }
+  }
+  return services;
+}
+
+async function loadRdapServices(signal: AbortSignal): Promise<Map<string, string>> {
+  try {
+    const response = await fetch(RDAP_BOOTSTRAP_ENDPOINT, { signal, headers: { Accept: "application/json" } });
+    if (!response.ok) return new Map();
+    return rdapServicesFromBootstrap(await response.json());
+  } catch (error) {
+    if (signal.aborted) throw error;
+    return new Map();
+  }
+}
+
 function addStandardPrice(result: DomainResult, pricing: Map<string, TldPricing>): DomainResult {
   if (result.availability !== "unregistered" && result.availability !== "available") return result;
   const suffix = suffixFor(result.domain, new Set(pricing.keys()));
@@ -172,10 +198,23 @@ async function checkNamecheap(domains: string[], signal: AbortSignal): Promise<D
   });
 }
 
-async function checkRdap(domain: string, signal: AbortSignal): Promise<DomainResult> {
+async function checkRdap(domain: string, services: Map<string, string>, signal: AbortSignal): Promise<DomainResult> {
   const namecheapUrl = purchaseUrl(domain);
+  const tld = domain.split(".").at(-1);
+  const service = tld ? services.get(tld) : undefined;
+  if (!service) {
+    return {
+      domain,
+      availability: "unknown",
+      source: "rdap",
+      error: `The .${tld ?? ""} registry does not publish an IANA-listed HTTPS RDAP service`,
+      namecheapUrl,
+      registrarConfirmationRequired: true,
+    };
+  }
   try {
-    const response = await fetch(`https://rdap.org/domain/${encodeURIComponent(domain)}`, {
+    const endpoint = `${service.replace(/\/?$/, "/")}domain/${encodeURIComponent(domain)}`;
+    const response = await fetch(endpoint, {
       signal,
       redirect: "follow",
       headers: { Accept: "application/rdap+json, application/json" },
@@ -200,11 +239,15 @@ const factory: CustomToolFactory = (pi) => ({
     const activeSignal = signal ?? new AbortController().signal;
     const domains = [...new Set(params.domains.map(normalizeDomain))];
     onUpdate?.({ content: [{ type: "text", text: `Checking ${domains.length} domain candidate${domains.length === 1 ? "" : "s"}...` }], details: { phase: "checking", count: domains.length } });
-    const [pricing, rawResults] = await Promise.all([
+    const useNamecheap = configuredForNamecheap();
+    const [pricing, rdapServices] = await Promise.all([
       loadTldPricing(activeSignal),
-      configuredForNamecheap() ? checkNamecheap(domains, activeSignal) : Promise.all(domains.map((domain) => checkRdap(domain, activeSignal))),
+      useNamecheap ? Promise.resolve(new Map<string, string>()) : loadRdapServices(activeSignal),
     ]);
-    const provider = configuredForNamecheap() ? "namecheap" : "rdap";
+    const rawResults = useNamecheap
+      ? await checkNamecheap(domains, activeSignal)
+      : await Promise.all(domains.map((domain) => checkRdap(domain, rdapServices, activeSignal)));
+    const provider = useNamecheap ? "namecheap" : "rdap";
     const results = rawResults.map((result) => addStandardPrice(result, pricing));
     const checkedAt = new Date().toISOString();
     const caveat = provider === "namecheap"
